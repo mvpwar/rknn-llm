@@ -6,8 +6,10 @@ import resource
 import threading
 import time
 import signal
+import json
 import gradio as gr
 import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # PROMPT_TEXT_PREFIX = "<|im_start|>system You are a helpful assistant. <|im_end|> <|im_start|>user"
 # PROMPT_TEXT_POSTFIX = "<|im_end|><|im_start|>assistant"
@@ -225,7 +227,7 @@ def callback_impl(result, userdata, state):
         global_state = state
         global_text += result.contents.text.decode('utf-8')
     return 0
-    
+
 
 # Connect the callback function between the Python side and the C++ side
 LLMResultCallback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(RKLLMResult), ctypes.c_void_p, ctypes.c_int)
@@ -303,7 +305,7 @@ class RKLLM(object):
         self.set_chat_template = rkllm_lib.rkllm_set_chat_template
         self.set_chat_template.argtypes = [RKLLM_Handle_t, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
         self.set_chat_template.restype = ctypes.c_int
-        
+
         system_prompt = "<|im_start|>system You are a helpful assistant. <|im_end|>"
         prompt_prefix = "<|im_start|>user"
         prompt_postfix = "<|im_end|><|im_start|>assistant"
@@ -328,7 +330,7 @@ class RKLLM(object):
             rkllm_load_lora(self.handle, ctypes.byref(lora_adapter))
             rkllm_lora_params = RKLLMLoraParam()
             rkllm_lora_params.lora_adapter_name = ctypes.c_char_p((lora_adapter_name).encode('utf-8'))
-        
+
         self.rkllm_infer_params = RKLLMInferParam()
         ctypes.memset(ctypes.byref(self.rkllm_infer_params), 0, ctypes.sizeof(RKLLMInferParam))
         self.rkllm_infer_params.mode = RKLLMInferMode.RKLLM_INFER_GENERATE
@@ -370,12 +372,205 @@ class RKLLM(object):
     def release(self):
         self.rkllm_destroy(self.handle)
 
+
+class OpenAIRequestHandler(BaseHTTPRequestHandler):
+    server_version = "RKLLMOpenAI/1.0"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            if not raw:
+                return {}
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _content_to_text(content):
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+            return " ".join(text_parts)
+        return ""
+
+    def _extract_prompt(self, messages):
+        if not isinstance(messages, list):
+            return ""
+        for message in reversed(messages):
+            if isinstance(message, dict) and message.get("role") == "user":
+                return self._content_to_text(message.get("content", ""))
+        return ""
+
+    def do_GET(self):
+        if self.path.rstrip("/") == "/v1/models":
+            self._send_json(200, {
+                "object": "list",
+                "data": [{
+                    "id": self.server.model_name,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "rkllm",
+                }],
+            })
+            return
+        self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
+
+    def do_POST(self):
+        if self.path.rstrip("/") != "/v1/chat/completions":
+            self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
+            return
+
+        payload = self._read_json()
+        if not isinstance(payload, dict):
+            self._send_json(400, {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
+            return
+
+        prompt = self._extract_prompt(payload.get("messages", []))
+        if not prompt:
+            self._send_json(400, {
+                "error": {
+                    "message": "messages must contain at least one user message",
+                    "type": "invalid_request_error",
+                }
+            })
+            return
+
+        sampling_params = RKLLMSamplingParam()
+        sampling_params.top_k = int(payload.get("top_k", 1))
+        sampling_params.top_p = float(payload.get("top_p", 0.9))
+        sampling_params.temperature = float(payload.get("temperature", 0.8))
+        sampling_params.repeat_penalty = float(payload.get("repeat_penalty", 1.1))
+        sampling_params.frequency_penalty = float(payload.get("frequency_penalty", 0.0))
+        sampling_params.presence_penalty = float(payload.get("presence_penalty", 0.0))
+        sampling_params.mirostat = int(payload.get("mirostat", 0))
+        sampling_params.mirostat_tau = float(payload.get("mirostat_tau", 5.0))
+        sampling_params.mirostat_eta = float(payload.get("mirostat_eta", 0.1))
+
+        max_new_tokens = payload.get("max_tokens")
+        if max_new_tokens is not None:
+            max_new_tokens = int(max_new_tokens)
+
+        stream = bool(payload.get("stream", False))
+        if stream:
+            self._stream_response(prompt, sampling_params, max_new_tokens)
+        else:
+            text = "".join(self.server.generate(prompt, sampling_params, max_new_tokens))
+            self._send_json(200, {
+                "id": "chatcmpl-" + str(int(time.time() * 1000000)),
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": self.server.model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+            })
+
+    def _stream_response(self, prompt, sampling_params, max_new_tokens):
+        request_id = "chatcmpl-" + str(int(time.time() * 1000000))
+        created = int(time.time())
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        def emit(payload):
+            self.wfile.write(("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
+            self.wfile.flush()
+
+        try:
+            for chunk in self.server.generate(prompt, sampling_params, max_new_tokens):
+                emit({
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": self.server.model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": chunk},
+                        "finish_reason": None,
+                    }],
+                })
+            emit({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": self.server.model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            })
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+class OpenAICompatibleServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+    def __init__(self, server_address, model, model_name="rkllm"):
+        self.model = model
+        self.model_name = model_name
+        self._lock = threading.Lock()
+        super().__init__(server_address, OpenAIRequestHandler)
+
+    def generate(self, prompt, sampling_params=None, max_new_tokens=None):
+        global global_text, global_state
+        with self._lock:
+            global_text = []
+            global_state = -1
+
+            worker = threading.Thread(
+                target=self.model.run,
+                args=(prompt, sampling_params, max_new_tokens),
+                daemon=True,
+            )
+            worker.start()
+
+            while worker.is_alive() or len(global_text) > 0:
+                while len(global_text) > 0:
+                    yield global_text.pop(0)
+                worker.join(timeout=0.01)
+
+
+def start_openai_server(model, host="0.0.0.0", port=8000, model_name="rkllm"):
+    server = OpenAICompatibleServer((host, port), model, model_name)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"OpenAI-compatible API listening on http://{host}:{port}/v1")
+    return server
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--rkllm_model_path', type=str, required=True, help='Absolute path of the converted RKLLM model on the Linux board;')
     parser.add_argument('--target_platform', type=str, required=True, help='Target platform: e.g., rk3588/rk3576;')
     parser.add_argument('--lora_model_path', type=str, help='Absolute path of the lora_model on the Linux board;')
     parser.add_argument('--prompt_cache_path', type=str, help='Absolute path of the prompt_cache file on the Linux board;')
+    parser.add_argument('--openai_host', type=str, default='0.0.0.0', help='Host for the OpenAI compatible HTTP API (default: 0.0.0.0).')
+    parser.add_argument('--openai_port', type=int, default=8000, help='Port for the OpenAI compatible HTTP API (set to 0 to disable).')
     args = parser.parse_args()
 
     if not os.path.exists(args.rkllm_model_path):
@@ -414,6 +609,10 @@ if __name__ == "__main__":
     rkllm_model = RKLLM(model_path, args.lora_model_path, args.prompt_cache_path, args.target_platform)
     print("==============================")
     sys.stdout.flush()
+
+    openai_server = None
+    if args.openai_port != 0:
+        openai_server = start_openai_server(rkllm_model, host=args.openai_host, port=args.openai_port, model_name="rkllm")
 
     # Graceful shutdown on Ctrl+C
     def shutdown_handler(signum, frame):
@@ -500,5 +699,11 @@ if __name__ == "__main__":
     finally:
         print("====================")
         print("RKLLM model inference completed, releasing RKLLM model resources...")
+        if openai_server is not None:
+            try:
+                openai_server.shutdown()
+                openai_server.server_close()
+            except Exception:
+                pass
         rkllm_model.release()
         print("====================")
