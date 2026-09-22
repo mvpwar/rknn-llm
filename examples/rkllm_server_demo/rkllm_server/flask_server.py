@@ -113,6 +113,9 @@ class RKLLM:
         self.run_fn = rkllm_lib.rkllm_run
         self.run_fn.argtypes = [RKLLM_Handle_t, ctypes.POINTER(RKLLMInput), ctypes.POINTER(RKLLMInferParam), ctypes.c_void_p]
         self.run_fn.restype = ctypes.c_int
+        self.clear_kv_cache_fn = rkllm_lib.rkllm_clear_kv_cache
+        self.clear_kv_cache_fn.argtypes = [RKLLM_Handle_t, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        self.clear_kv_cache_fn.restype = ctypes.c_int
         self.set_tools_fn = rkllm_lib.rkllm_set_function_tools
         self.set_tools_fn.argtypes = [RKLLM_Handle_t, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
         self.set_tools_fn.restype = ctypes.c_int
@@ -122,9 +125,17 @@ class RKLLM:
         self.infer = RKLLMInferParam()
         ctypes.memset(ctypes.byref(self.infer), 0, ctypes.sizeof(self.infer))
         self.infer.mode = RKLLMInferMode.RKLLM_INFER_GENERATE
+        # Do not retain conversation history between HTTP requests. This also
+        # makes the initial KV cache state explicit when the server starts.
+        self.infer.keep_history = 0
+        self.clear_context()
+
+    def clear_context(self):
+        rc = self.clear_kv_cache_fn(self.handle, 1, None, None)
+        if rc != 0:
+            raise RuntimeError("rkllm_clear_kv_cache failed: %s" % rc)
 
     def configure_tools(self, system, tools):
-        # RKLLM expects the JSON array of OpenAI function/tool definitions.
         raw = json.dumps(tools, ensure_ascii=False).encode()
         return self.set_tools_fn(self.handle, system.encode(), raw, b"tool_response")
 
@@ -140,6 +151,8 @@ class RKLLM:
             rc = self.run_fn(self.handle, ctypes.byref(inp), ctypes.byref(self.infer), None)
             if rc != 0:
                 raise RuntimeError("rkllm_run failed: %s" % rc)
+            if global_state == LLMCallState.RKLLM_RUN_ERROR:
+                raise RuntimeError("rkllm_run failed: RKLLM_RUN_ERROR (prompt may exceed max context)")
         finally:
             self.infer.sampling_params = None
             self.infer.max_new_tokens = 0
@@ -156,8 +169,6 @@ def text_content(value):
 
 
 def prompt_from_messages(messages):
-    # The native tool template is configured separately. Keep the complete
-    # conversation here so follow-up tool results are visible to the model.
     out = []
     for m in messages:
         if not isinstance(m, dict): continue
@@ -209,11 +220,25 @@ def error(message, typ="invalid_request_error", code=400):
 def run_model(model, prompt, role, thinking, sampling, max_tokens):
     global global_text, global_state
     global_text, global_state = [], -1
-    t = threading.Thread(target=model.run, args=(prompt, role, thinking, sampling, max_tokens), daemon=True)
+    worker_error = []
+
+    def worker():
+        try:
+            model.run(prompt, role, thinking, sampling, max_tokens)
+        except BaseException as exc:
+            # Exceptions in a worker thread do not reach Flask automatically.
+            # Capture them and re-raise in the request thread instead.
+            worker_error.append(exc)
+
+    t = threading.Thread(target=worker, daemon=True)
     t.start(); result = []
     while t.is_alive() or global_text:
         while global_text: result.append(global_text.pop(0))
         t.join(.01)
+    if worker_error:
+        raise worker_error[0]
+    if global_state == LLMCallState.RKLLM_RUN_ERROR:
+        raise RuntimeError("rkllm_run failed: RKLLM_RUN_ERROR")
     return "".join(result)
 
 
@@ -237,12 +262,14 @@ def chat_completions():
     messages = data["messages"]; tools = data.get("tools") or []
     if tools and not isinstance(tools, list): return error("'tools' must be an array")
     choice = data.get("tool_choice", "auto")
-    if choice == "none": tools_for_model = []
-    else: tools_for_model = tools
+    tools_for_model = [] if choice == "none" else tools
     system = next((text_content(m.get("content", "")) for m in messages if m.get("role") == "system"), "")
-    with lock:
-        if tools_for_model: rkllm_model.configure_tools(system, tools_for_model)
-        raw = run_model(rkllm_model, prompt_from_messages(messages), "user", data.get("enable_thinking", False), make_sampling(data), data.get("max_tokens", 4096))
+    try:
+        with lock:
+            if tools_for_model: rkllm_model.configure_tools(system, tools_for_model)
+            raw = run_model(rkllm_model, prompt_from_messages(messages), "user", data.get("enable_thinking", False), make_sampling(data), data.get("max_tokens", 4096))
+    except Exception as exc:
+        return error(str(exc), "server_error", 500)
     calls = extract_tool_calls(raw) if tools_for_model and choice != "none" else []
     if choice == "required" and not calls: return error("The model did not return a tool call", "server_error", 500)
     ident, created, model = completion_id(), int(time.time()), data.get("model", rkllm_model.model_name)
