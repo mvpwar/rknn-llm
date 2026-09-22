@@ -167,7 +167,6 @@ def text_content(value):
 
 
 def compact_tool_call(call):
-    """Keep only data the model needs to understand a previous tool call."""
     if not isinstance(call, dict):
         return call
     fn = call.get("function", call)
@@ -180,14 +179,10 @@ def compact_tool_call(call):
 
 
 def compact_message(message):
-    """Remove OpenAI transport metadata without changing message meaning."""
     role = message.get("role", "user")
     if role == "assistant" and message.get("tool_calls"):
-        calls = [compact_tool_call(x) for x in message["tool_calls"]]
-        return {"role": "assistant", "tool_calls": calls}
+        return {"role": "assistant", "tool_calls": [compact_tool_call(x) for x in message["tool_calls"]]}
     if role == "tool":
-        # The native prompt only needs the result. The id is transport metadata
-        # and is repeated in the assistant tool call.
         return {"role": "tool", "content": text_content(message.get("content", ""))}
     return {"role": role, "content": text_content(message.get("content", ""))}
 
@@ -199,10 +194,10 @@ def message_value(message):
     return text_content(message.get("content", ""))
 
 
-def prompt_from_messages(messages):
+def prompt_from_messages(messages, include_system=True):
     lines = []
     for message in messages:
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or (not include_system and message.get("role") == "system"):
             continue
         lines.append("{}: {}".format(message.get("role", "user"), message_value(message)))
     lines.append("assistant:")
@@ -210,13 +205,10 @@ def prompt_from_messages(messages):
 
 
 def token_estimate(text):
-    # This is diagnostic only; RKLLM's tokenizer is not exposed by this ABI.
-    # CJK characters are close to one token, ASCII words are normally cheaper.
     return max(1, int(sum(1 if ord(c) >= 0x2E80 else 0.25 for c in text))) if text else 0
 
 
 def compact_tools(tools):
-    """Remove schema presentation noise while preserving function semantics."""
     result = []
     for tool in tools:
         if not isinstance(tool, dict):
@@ -233,38 +225,40 @@ def compact_tools(tools):
     return result
 
 
-def diagnostic_breakdown(messages, tools):
+def diagnostic_breakdown(messages, tools, include_system=True):
     rows = []
     for index, message in enumerate(messages):
+        if not include_system and message.get("role") == "system":
+            continue
         text = "{}: {}\n".format(message.get("role", "user"), message_value(message))
-        rows.append({"index": index, "role": message.get("role", "user"),
-                     "chars": len(text), "estimated_tokens": token_estimate(text)})
+        rows.append({"index": index, "role": message.get("role", "user"), "chars": len(text), "estimated_tokens": token_estimate(text)})
+    prompt = prompt_from_messages(messages, include_system=include_system)
     tool_text = json.dumps(tools, ensure_ascii=False, separators=(",", ":")) if tools else ""
-    prompt = prompt_from_messages(messages)
     total = token_estimate(prompt) + token_estimate(tool_text)
+    log.info("prompt breakdown: messages=%d chars=%d estimated_tokens=%d tools_chars=%d tools_estimated_tokens=%d native_system_injected=%s",
+             len(rows), len(prompt), token_estimate(prompt), len(tool_text), token_estimate(tool_text), include_system is False)
     for row in rows:
         row["ratio"] = round(row["estimated_tokens"] * 100 / max(total, 1), 1)
-    log.info("prompt breakdown: messages=%d chars=%d estimated_tokens=%d tools_chars=%d tools_estimated_tokens=%d",
-             len(messages), len(prompt), token_estimate(prompt), len(tool_text), token_estimate(tool_text))
-    for row in rows:
         log.info("prompt part index=%d role=%s chars=%d estimated_tokens=%d ratio=%.1f%%",
                  row["index"], row["role"], row["chars"], row["estimated_tokens"], row["ratio"])
     return total
 
 
-def semantic_compact(messages, tools, budget=3000):
-    """Drop complete, low-value history units; never cut a string or JSON value."""
+def semantic_compact(messages, tools, budget=2600):
     valid = [compact_message(m) for m in messages if isinstance(m, dict)]
     system = next((m for m in valid if m.get("role") == "system"), None)
     rest = [m for m in valid if m.get("role") != "system"]
     compacted_tools = compact_tools(tools)
 
-    def cost(items):
-        return token_estimate(prompt_from_messages(([system] if system else []) + items)) + token_estimate(json.dumps(compacted_tools, ensure_ascii=False, separators=(",", ":")))
+    # rkllm_set_function_tools() injects this system prompt into the native
+    # tool template. Do not send the same system message again as plain text.
+    native_system = bool(compacted_tools and system)
+    prompt_messages = rest if native_system else (([system] if system else []) + rest)
 
-    # Remove old completed tool exchanges first. They are reproducible transport
-    # history and are usually the largest repeated payload.
-    keep = list(rest)
+    def cost(items):
+        return token_estimate(prompt_from_messages(items, include_system=True)) + token_estimate(json.dumps(compacted_tools, ensure_ascii=False, separators=(",", ":")))
+
+    keep = list(prompt_messages)
     removed = []
     i = 0
     while i < len(keep):
@@ -272,8 +266,6 @@ def semantic_compact(messages, tools, budget=3000):
             removed.extend(keep[i:i + 2]); del keep[i:i + 2]; continue
         i += 1
 
-    # Then remove whole old assistant answers, followed by old user turns. The
-    # newest request and its immediately preceding tool exchange are retained.
     for role in ("assistant", "user"):
         i = 0
         while cost(keep) > budget and i < len(keep) - 1:
@@ -283,10 +275,10 @@ def semantic_compact(messages, tools, budget=3000):
 
     if cost(keep) > budget:
         raise ValueError("prompt remains too large after semantic compaction; "
-                         "remove large tool results or increase max_context_len")
+                         "the current system prompt, tool definitions, or latest message must be reduced")
     if removed:
         log.info("semantic compaction removed %d complete history messages", len(removed))
-    return ([system] if system else []) + keep, compacted_tools
+    return (([system] if system and not native_system else []) + keep), compacted_tools, system, native_system
 
 
 def extract_tool_calls(raw):
@@ -295,10 +287,8 @@ def extract_tool_calls(raw):
         blocks = re.findall(r"<\|tool_call\|>\s*(.*?)\s*<\|tool_call_end\|>", raw, re.S)
     values = []
     for block in blocks or [raw.strip()]:
-        try:
-            value = json.loads(block)
-        except (TypeError, ValueError):
-            continue
+        try: value = json.loads(block)
+        except (TypeError, ValueError): continue
         if isinstance(value, dict) and isinstance(value.get("tool_calls"), list): values.extend(value["tool_calls"])
         elif isinstance(value, list): values.extend(value)
         elif isinstance(value, dict): values.append(value)
@@ -309,15 +299,13 @@ def extract_tool_calls(raw):
         if not isinstance(fn, dict) or not fn.get("name"): continue
         args = fn.get("arguments", {})
         if not isinstance(args, str): args = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
-        calls.append({"id": value.get("id") or "call_" + uuid.uuid4().hex,
-                      "type": "function", "function": {"name": fn["name"], "arguments": args}})
+        calls.append({"id": value.get("id") or "call_" + uuid.uuid4().hex, "type": "function", "function": {"name": fn["name"], "arguments": args}})
     return calls
 
 
 def completion_id(): return "chatcmpl-" + uuid.uuid4().hex[:24]
 def sse(obj): return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
-def error(message, typ="invalid_request_error", code=400):
-    return jsonify({"error": {"message": message, "type": typ, "param": None, "code": None}}), code
+def error(message, typ="invalid_request_error", code=400): return jsonify({"error": {"message": message, "type": typ, "param": None, "code": None}}), code
 
 
 def run_model(model, prompt, role, thinking, sampling, max_tokens):
@@ -337,9 +325,7 @@ def run_model(model, prompt, role, thinking, sampling, max_tokens):
 
 
 def make_sampling(data):
-    p = RKLLMSamplingParam()
-    p.top_k = int(data.get("top_k", 1)); p.top_p = float(data.get("top_p", .9)); p.temperature = float(data.get("temperature", .8)); p.repeat_penalty = float(data.get("repeat_penalty", 1.1)); p.frequency_penalty = float(data.get("frequency_penalty", 0)); p.presence_penalty = float(data.get("presence_penalty", 0))
-    return p
+    p = RKLLMSamplingParam(); p.top_k = int(data.get("top_k", 1)); p.top_p = float(data.get("top_p", .9)); p.temperature = float(data.get("temperature", .8)); p.repeat_penalty = float(data.get("repeat_penalty", 1.1)); p.frequency_penalty = float(data.get("frequency_penalty", 0)); p.presence_penalty = float(data.get("presence_penalty", 0)); return p
 
 
 @app.route('/v1/models', methods=['GET'])
@@ -355,13 +341,16 @@ def chat_completions():
     if tools and not isinstance(tools, list): return error("'tools' must be an array")
     choice = data.get("tool_choice", "auto"); tools_for_model = [] if choice == "none" else tools
     try:
-        messages, compacted_tools = semantic_compact(raw_messages, tools_for_model)
-        diagnostic_breakdown(messages, compacted_tools)
-        system = next((text_content(m.get("content", "")) for m in messages if m.get("role") == "system"), "")
+        messages, compacted_tools, system, native_system = semantic_compact(raw_messages, tools_for_model)
+        diagnostic_breakdown(messages, compacted_tools, include_system=not native_system)
         prompt = prompt_from_messages(messages)
         with lock:
-            if compacted_tools: rkllm_model.configure_tools(system, compacted_tools)
-            raw = run_model(rkllm_model, prompt, "user", data.get("enable_thinking", False), make_sampling(data), data.get("max_tokens", 4096))
+            if compacted_tools:
+                # Pass system exactly once: the native function-tool template
+                # owns it, while prompt contains only conversation turns.
+                rc = rkllm_model.configure_tools(text_content(system.get("content", "")) if system else "", compacted_tools)
+                if rc != 0: raise RuntimeError("rkllm_set_function_tools failed: %s" % rc)
+            raw = run_model(rkllm_model, prompt, "user", bool(data.get("enable_thinking", False)), make_sampling(data), data.get("max_tokens", 4096))
     except Exception as exc:
         log.exception("inference failed")
         return error(str(exc), "server_error", 500)
@@ -371,18 +360,14 @@ def chat_completions():
     message = {"role": "assistant", "content": None if calls else raw}
     if calls: message["tool_calls"] = calls
     usage = {"prompt_tokens": token_estimate(prompt), "completion_tokens": len(raw.split())}; usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-    if not data.get("stream", False):
-        return jsonify({"id": ident, "object": "chat.completion", "created": created, "model": model, "choices": [{"index": 0, "message": message, "logprobs": None, "finish_reason": finish}], "usage": usage})
+    if not data.get("stream", False): return jsonify({"id": ident, "object": "chat.completion", "created": created, "model": model, "choices": [{"index": 0, "message": message, "logprobs": None, "finish_reason": finish}], "usage": usage})
     def stream_response():
-        base = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": model}
-        yield sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant"}, "logprobs": None, "finish_reason": None}]})
+        base = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": model}; yield sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant"}, "logprobs": None, "finish_reason": None}]})
         if calls:
             for i, call in enumerate(calls):
-                delta = {"tool_calls": [{"index": i, "id": call["id"], "type": "function", "function": {"name": call["function"]["name"], "arguments": call["function"]["arguments"]}}]}
-                yield sse({**base, "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": None}]})
+                delta = {"tool_calls": [{"index": i, "id": call["id"], "type": "function", "function": {"name": call["function"]["name"], "arguments": call["function"]["arguments"]}}]}; yield sse({**base, "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": None}]})
         else:
-            for part in re.findall(r".{1,64}", raw, re.S):
-                yield sse({**base, "choices": [{"index": 0, "delta": {"content": part}, "logprobs": None, "finish_reason": None}]})
+            for part in re.findall(r".{1,64}", raw, re.S): yield sse({**base, "choices": [{"index": 0, "delta": {"content": part}, "logprobs": None, "finish_reason": None}]})
         yield sse({**base, "choices": [{"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}], "usage": usage}); yield "data: [DONE]\n\n"
     return Response(stream_with_context(stream_response()), content_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
