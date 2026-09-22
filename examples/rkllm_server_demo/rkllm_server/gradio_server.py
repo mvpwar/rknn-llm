@@ -7,703 +7,295 @@ import threading
 import time
 import signal
 import json
+import re
+import uuid
 import gradio as gr
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# PROMPT_TEXT_PREFIX = "<|im_start|>system You are a helpful assistant. <|im_end|> <|im_start|>user"
-# PROMPT_TEXT_POSTFIX = "<|im_end|><|im_start|>assistant"
-
-# Set environment variables
+# Keep the original Gradio configuration and RKLLM model path unchanged.
 os.environ["GRADIO_SERVER_NAME"] = "0.0.0.0"
 os.environ["GRADIO_SERVER_PORT"] = "8080"
-
-# Set the dynamic library path
 rkllm_lib = ctypes.CDLL('lib/librkllmrt.so')
 
-# Define the structures from the library
 RKLLM_Handle_t = ctypes.c_void_p
 userdata = ctypes.c_void_p(None)
-
 LLMCallState = ctypes.c_int
-LLMCallState.RKLLM_RUN_NORMAL  = 0
-LLMCallState.RKLLM_RUN_WAITING  = 1
-LLMCallState.RKLLM_RUN_FINISH  = 2
-LLMCallState.RKLLM_RUN_ERROR   = 3
-
+LLMCallState.RKLLM_RUN_NORMAL = 0
+LLMCallState.RKLLM_RUN_WAITING = 1
+LLMCallState.RKLLM_RUN_FINISH = 2
+LLMCallState.RKLLM_RUN_ERROR = 3
 RKLLMInputType = ctypes.c_int
-RKLLMInputType.RKLLM_INPUT_PROMPT      = 0
-RKLLMInputType.RKLLM_INPUT_TOKEN       = 1
-RKLLMInputType.RKLLM_INPUT_EMBED       = 2
-RKLLMInputType.RKLLM_INPUT_MULTIMODAL  = 3
-
+RKLLMInputType.RKLLM_INPUT_PROMPT = 0
+RKLLMInputType.RKLLM_INPUT_TOKEN = 1
+RKLLMInputType.RKLLM_INPUT_EMBED = 2
+RKLLMInputType.RKLLM_INPUT_MULTIMODAL = 3
 RKLLMInferMode = ctypes.c_int
 RKLLMInferMode.RKLLM_INFER_GENERATE = 0
 RKLLMInferMode.RKLLM_INFER_GET_LAST_HIDDEN_LAYER = 1
 RKLLMInferMode.RKLLM_INFER_GET_LOGITS = 2
 
 class RKLLMExtendParam(ctypes.Structure):
-    _fields_ = [
-        ("base_domain_id", ctypes.c_int32),
-        ("embed_flash", ctypes.c_int8),
-        ("enabled_cpus_num", ctypes.c_int8),
-        ("enabled_cpus_mask", ctypes.c_uint32),
-        ("n_batch", ctypes.c_uint8),
-        ("use_cross_attn", ctypes.c_int8),
-        ("reserved", ctypes.c_uint8 * 104)
-    ]
-
+    _fields_ = [("base_domain_id", ctypes.c_int32), ("embed_flash", ctypes.c_int8), ("enabled_cpus_num", ctypes.c_int8), ("enabled_cpus_mask", ctypes.c_uint32), ("n_batch", ctypes.c_uint8), ("use_cross_attn", ctypes.c_int8), ("reserved", ctypes.c_uint8 * 104)]
 class RKLLMParam(ctypes.Structure):
-    _fields_ = [
-        ("model_path", ctypes.c_char_p),
-        ("max_context_len", ctypes.c_int32),
-        ("max_new_tokens", ctypes.c_int32),
-        ("top_k", ctypes.c_int32),
-        ("n_keep", ctypes.c_int32),
-        ("top_p", ctypes.c_float),
-        ("temperature", ctypes.c_float),
-        ("repeat_penalty", ctypes.c_float),
-        ("frequency_penalty", ctypes.c_float),
-        ("presence_penalty", ctypes.c_float),
-        ("mirostat", ctypes.c_int32),
-        ("mirostat_tau", ctypes.c_float),
-        ("mirostat_eta", ctypes.c_float),
-        ("skip_special_token", ctypes.c_bool),
-        ("ignore_eos_token", ctypes.c_bool),
-        ("is_async", ctypes.c_bool),
-        ("extend_param", RKLLMExtendParam),
-    ]
-
+    _fields_ = [("model_path", ctypes.c_char_p), ("max_context_len", ctypes.c_int32), ("max_new_tokens", ctypes.c_int32), ("top_k", ctypes.c_int32), ("n_keep", ctypes.c_int32), ("top_p", ctypes.c_float), ("temperature", ctypes.c_float), ("repeat_penalty", ctypes.c_float), ("frequency_penalty", ctypes.c_float), ("presence_penalty", ctypes.c_float), ("mirostat", ctypes.c_int32), ("mirostat_tau", ctypes.c_float), ("mirostat_eta", ctypes.c_float), ("skip_special_token", ctypes.c_bool), ("ignore_eos_token", ctypes.c_bool), ("is_async", ctypes.c_bool), ("extend_param", RKLLMExtendParam)]
 class RKLLMLoraAdapter(ctypes.Structure):
-    _fields_ = [
-        ("lora_adapter_path", ctypes.c_char_p),
-        ("lora_adapter_name", ctypes.c_char_p),
-        ("scale", ctypes.c_float)
-    ]
-
+    _fields_ = [("lora_adapter_path", ctypes.c_char_p), ("lora_adapter_name", ctypes.c_char_p), ("scale", ctypes.c_float)]
 class RKLLMEmbedInput(ctypes.Structure):
-    _fields_ = [
-        ("embed", ctypes.POINTER(ctypes.c_float)),
-        ("n_tokens", ctypes.c_size_t)
-    ]
-
+    _fields_ = [("embed", ctypes.POINTER(ctypes.c_float)), ("n_tokens", ctypes.c_size_t)]
 class RKLLMTokenInput(ctypes.Structure):
-    _fields_ = [
-        ("input_ids", ctypes.POINTER(ctypes.c_int32)),
-        ("n_tokens", ctypes.c_size_t)
-    ]
-
+    _fields_ = [("input_ids", ctypes.POINTER(ctypes.c_int32)), ("n_tokens", ctypes.c_size_t)]
 class RKLLMImageInput(ctypes.Structure):
-    _fields_ = [
-        ("image_embed", ctypes.POINTER(ctypes.c_float)),
-        ("n_image_tokens", ctypes.c_size_t),
-        ("n_image", ctypes.c_size_t),
-        ("image_start", ctypes.c_char_p),
-        ("image_end", ctypes.c_char_p),
-        ("image_content", ctypes.c_char_p),
-        ("image_width", ctypes.c_size_t),
-        ("image_height", ctypes.c_size_t),
-    ]
-
+    _fields_ = [("image_embed", ctypes.POINTER(ctypes.c_float)), ("n_image_tokens", ctypes.c_size_t), ("n_image", ctypes.c_size_t), ("image_start", ctypes.c_char_p), ("image_end", ctypes.c_char_p), ("image_content", ctypes.c_char_p), ("image_width", ctypes.c_size_t), ("image_height", ctypes.c_size_t)]
 class RKLLMVideoInput(ctypes.Structure):
-    _fields_ = [
-        ("video_embed", ctypes.POINTER(ctypes.c_float)),
-        ("n_frame_tokens", ctypes.c_size_t),
-        ("n_frame_per_video", ctypes.c_size_t),
-        ("n_video", ctypes.c_size_t),
-        ("video_start", ctypes.c_char_p),
-        ("video_end", ctypes.c_char_p),
-        ("video_content", ctypes.c_char_p),
-        ("frame_width", ctypes.c_size_t),
-        ("frame_height", ctypes.c_size_t),
-    ]
-
+    _fields_ = [("video_embed", ctypes.POINTER(ctypes.c_float)), ("n_frame_tokens", ctypes.c_size_t), ("n_frame_per_video", ctypes.c_size_t), ("n_video", ctypes.c_size_t), ("video_start", ctypes.c_char_p), ("video_end", ctypes.c_char_p), ("video_content", ctypes.c_char_p), ("frame_width", ctypes.c_size_t), ("frame_height", ctypes.c_size_t)]
 class RKLLMMultiModalInput(ctypes.Structure):
-    _fields_ = [
-        ("prompt", ctypes.c_char_p),
-        ("image", RKLLMImageInput),
-        ("video", RKLLMVideoInput),
-    ]
-
+    _fields_ = [("prompt", ctypes.c_char_p), ("image", RKLLMImageInput), ("video", RKLLMVideoInput)]
 class RKLLMInputUnion(ctypes.Union):
-    _fields_ = [
-        ("prompt_input", ctypes.c_char_p),
-        ("embed_input", RKLLMEmbedInput),
-        ("token_input", RKLLMTokenInput),
-        ("multimodal_input", RKLLMMultiModalInput)
-    ]
-
+    _fields_ = [("prompt_input", ctypes.c_char_p), ("embed_input", RKLLMEmbedInput), ("token_input", RKLLMTokenInput), ("multimodal_input", RKLLMMultiModalInput)]
 class RKLLMInput(ctypes.Structure):
     _anonymous_ = ("input_data",)
-    _fields_ = [
-        ("role", ctypes.c_char_p),
-        ("enable_thinking", ctypes.c_bool),
-        ("input_type", RKLLMInputType),
-        ("input_data", RKLLMInputUnion)
-    ]
-
+    _fields_ = [("role", ctypes.c_char_p), ("enable_thinking", ctypes.c_bool), ("input_type", RKLLMInputType), ("input_data", RKLLMInputUnion)]
 class RKLLMLoraParam(ctypes.Structure):
-    _fields_ = [
-        ("lora_adapter_name", ctypes.c_char_p)
-    ]
-
+    _fields_ = [("lora_adapter_name", ctypes.c_char_p)]
 class RKLLMPromptCacheParam(ctypes.Structure):
-    _fields_ = [
-        ("save_prompt_cache", ctypes.c_int),
-        ("prompt_cache_path", ctypes.c_char_p)
-    ]
-
+    _fields_ = [("save_prompt_cache", ctypes.c_int), ("prompt_cache_path", ctypes.c_char_p)]
 class RKLLMSamplingParam(ctypes.Structure):
-    _fields_ = [
-        ("top_k", ctypes.c_int32),
-        ("top_p", ctypes.c_float),
-        ("temperature", ctypes.c_float),
-        ("repeat_penalty", ctypes.c_float),
-        ("frequency_penalty", ctypes.c_float),
-        ("presence_penalty", ctypes.c_float),
-        ("mirostat", ctypes.c_int32),
-        ("mirostat_tau", ctypes.c_float),
-        ("mirostat_eta", ctypes.c_float),
-    ]
-
+    _fields_ = [("top_k", ctypes.c_int32), ("top_p", ctypes.c_float), ("temperature", ctypes.c_float), ("repeat_penalty", ctypes.c_float), ("frequency_penalty", ctypes.c_float), ("presence_penalty", ctypes.c_float), ("mirostat", ctypes.c_int32), ("mirostat_tau", ctypes.c_float), ("mirostat_eta", ctypes.c_float)]
 class RKLLMInferParam(ctypes.Structure):
-    _fields_ = [
-        ("mode", RKLLMInferMode),
-        ("lora_params", ctypes.POINTER(RKLLMLoraParam)),
-        ("prompt_cache_params", ctypes.POINTER(RKLLMPromptCacheParam)),
-        ("sampling_params", ctypes.POINTER(RKLLMSamplingParam)),
-        ("keep_history", ctypes.c_int),
-        ("max_new_tokens", ctypes.c_int32),
-    ]
-
+    _fields_ = [("mode", RKLLMInferMode), ("lora_params", ctypes.POINTER(RKLLMLoraParam)), ("prompt_cache_params", ctypes.POINTER(RKLLMPromptCacheParam)), ("sampling_params", ctypes.POINTER(RKLLMSamplingParam)), ("keep_history", ctypes.c_int), ("max_new_tokens", ctypes.c_int32)]
 class RKLLMResultLastHiddenLayer(ctypes.Structure):
-    _fields_ = [
-        ("hidden_states", ctypes.POINTER(ctypes.c_float)),
-        ("embd_size", ctypes.c_int),
-        ("num_tokens", ctypes.c_int)
-    ]
-
+    _fields_ = [("hidden_states", ctypes.POINTER(ctypes.c_float)), ("embd_size", ctypes.c_int), ("num_tokens", ctypes.c_int)]
 class RKLLMResultLogits(ctypes.Structure):
-    _fields_ = [
-        ("logits", ctypes.POINTER(ctypes.c_float)),
-        ("vocab_size", ctypes.c_int),
-        ("num_tokens", ctypes.c_int)
-    ]
-
+    _fields_ = [("logits", ctypes.POINTER(ctypes.c_float)), ("vocab_size", ctypes.c_int), ("num_tokens", ctypes.c_int)]
 class RKLLMPerfStat(ctypes.Structure):
-    _fields_ = [
-        ("prefill_time_ms", ctypes.c_float),
-        ("prefill_tokens", ctypes.c_int),
-        ("generate_time_ms", ctypes.c_float),
-        ("generate_tokens", ctypes.c_int),
-        ("memory_usage_mb", ctypes.c_float)
-    ]
-
+    _fields_ = [("prefill_time_ms", ctypes.c_float), ("prefill_tokens", ctypes.c_int), ("generate_time_ms", ctypes.c_float), ("generate_tokens", ctypes.c_int), ("memory_usage_mb", ctypes.c_float)]
 class RKLLMResult(ctypes.Structure):
-    _fields_ = [
-        ("text", ctypes.c_char_p),
-        ("token_id", ctypes.c_int),
-        ("last_hidden_layer", RKLLMResultLastHiddenLayer),
-        ("logits", RKLLMResultLogits),
-        ("perf", RKLLMPerfStat)
-    ]
+    _fields_ = [("text", ctypes.c_char_p), ("token_id", ctypes.c_int), ("last_hidden_layer", RKLLMResultLastHiddenLayer), ("logits", RKLLMResultLogits), ("perf", RKLLMPerfStat)]
 
-# Define global variables to store the callback function output for displaying in the Gradio interface
 global_text = []
 global_state = -1
-split_byte_data = bytes(b"") # Used to store the segmented byte data
+split_byte_data = bytes()
 
-# Define the callback function
 def callback_impl(result, userdata, state):
-    global global_text, global_state, split_byte_data
-    if state == LLMCallState.RKLLM_RUN_FINISH:
-        global_state = state
-        sys.stdout.flush()
+    global global_text, global_state
+    global_state = state
+    if state == LLMCallState.RKLLM_RUN_NORMAL and result.contents.text:
+        # The original callback stores output in the shared streaming buffer.
+        global_text.append(result.contents.text.decode('utf-8'))
     elif state == LLMCallState.RKLLM_RUN_ERROR:
-        global_state = state
         print("run error")
         sys.stdout.flush()
-    elif state == LLMCallState.RKLLM_RUN_NORMAL:
-        global_state = state
-        global_text += result.contents.text.decode('utf-8')
     return 0
 
-
-# Connect the callback function between the Python side and the C++ side
 LLMResultCallback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(RKLLMResult), ctypes.c_void_p, ctypes.c_int)
 LLMTokenizerCallback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32), ctypes.c_int32)
 LLMGetEmbedCallback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64)
-
 class RKLLMCallback(ctypes.Structure):
-    _fields_ = [
-        ("result_callback", LLMResultCallback_type),
-        ("result_userdata", ctypes.c_void_p),
-        ("tokenizer_callback", LLMTokenizerCallback_type),
-        ("tokenizer_userdata", ctypes.c_void_p),
-        ("embed_callback", LLMGetEmbedCallback_type),
-        ("embed_userdata", ctypes.c_void_p),
-    ]
-
+    _fields_ = [("result_callback", LLMResultCallback_type), ("result_userdata", ctypes.c_void_p), ("tokenizer_callback", LLMTokenizerCallback_type), ("tokenizer_userdata", ctypes.c_void_p), ("embed_callback", LLMGetEmbedCallback_type), ("embed_userdata", ctypes.c_void_p)]
 callback = LLMResultCallback_type(callback_impl)
 
-# Define the RKLLM class, which includes initialization, inference, and release operations for the RKLLM model in the dynamic library
-class RKLLM(object):
-    def __init__(self, model_path, lora_model_path = None, prompt_cache_path = None, platform = "rk3588"):
-        rkllm_param = RKLLMParam()
-        rkllm_param.model_path = bytes(model_path, 'utf-8')
-
-        rkllm_param.max_context_len = 4096
-        rkllm_param.max_new_tokens = 4096
-        rkllm_param.skip_special_token = True
-        rkllm_param.n_keep = -1
-        rkllm_param.top_k = 1
-        rkllm_param.top_p = 0.9
-        rkllm_param.temperature = 0.8
-        rkllm_param.repeat_penalty = 1.1
-        rkllm_param.frequency_penalty = 0.0
-        rkllm_param.presence_penalty = 0.0
-
-        rkllm_param.mirostat = 0
-        rkllm_param.mirostat_tau = 5.0
-        rkllm_param.mirostat_eta = 0.1
-
-        rkllm_param.is_async = False
-
-        rkllm_param.ignore_eos_token = False
-
-        rkllm_param.extend_param.base_domain_id = 0
-        rkllm_param.extend_param.embed_flash = 1
-        rkllm_param.extend_param.n_batch = 1
-        rkllm_param.extend_param.use_cross_attn = 0
-        rkllm_param.extend_param.enabled_cpus_num = 4
-        if platform.lower() in ["rk3576", "rk3588"]:
-            rkllm_param.extend_param.enabled_cpus_mask = (1 << 4)|(1 << 5)|(1 << 6)|(1 << 7)
-        else:
-            rkllm_param.extend_param.enabled_cpus_mask = (1 << 0)|(1 << 1)|(1 << 2)|(1 << 3)
+class RKLLM:
+    def __init__(self, model_path, lora_model_path=None, prompt_cache_path=None, platform="rk3588"):
+        p = RKLLMParam()
+        p.model_path = bytes(model_path, 'utf-8')
+        p.max_context_len, p.max_new_tokens, p.skip_special_token, p.n_keep = 4096, 4096, True, -1
+        p.top_k, p.top_p, p.temperature, p.repeat_penalty = 1, .9, .8, 1.1
+        p.frequency_penalty = p.presence_penalty = 0.0
+        p.mirostat, p.mirostat_tau, p.mirostat_eta = 0, 5.0, .1
+        p.is_async, p.ignore_eos_token = False, False
+        p.extend_param.base_domain_id, p.extend_param.embed_flash = 0, 1
+        p.extend_param.n_batch, p.extend_param.use_cross_attn, p.extend_param.enabled_cpus_num = 1, 0, 4
+        p.extend_param.enabled_cpus_mask = ((1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)) if platform.lower() in ["rk3576", "rk3588"] else 15
         self.handle = RKLLM_Handle_t()
-
         self.rkllm_init = rkllm_lib.rkllm_init
         self.rkllm_init.argtypes = [ctypes.POINTER(RKLLM_Handle_t), ctypes.POINTER(RKLLMParam), ctypes.POINTER(RKLLMCallback)]
         self.rkllm_init.restype = ctypes.c_int
-        self.callback = RKLLMCallback()
-        self.callback.result_callback = callback
-        self.callback.result_userdata = None
-        self.callback.tokenizer_callback = LLMTokenizerCallback_type()
-        self.callback.tokenizer_userdata = None
-        self.callback.embed_callback = LLMGetEmbedCallback_type()
-        self.callback.embed_userdata = None
-        ret = self.rkllm_init(ctypes.byref(self.handle), ctypes.byref(rkllm_param), ctypes.byref(self.callback))
-        if (ret != 0):
-            print("\nrkllm init failed\n")
-            exit(0)
-        else:
-            print("\nrkllm init success!\n")
+        self.callback = RKLLMCallback(callback, None, LLMTokenizerCallback_type(), None, LLMGetEmbedCallback_type(), None)
+        if self.rkllm_init(ctypes.byref(self.handle), ctypes.byref(p), ctypes.byref(self.callback)) != 0:
+            raise RuntimeError("rkllm init failed")
+        print("\nrkllm init success!\n")
         self.rkllm_run = rkllm_lib.rkllm_run
         self.rkllm_run.argtypes = [RKLLM_Handle_t, ctypes.POINTER(RKLLMInput), ctypes.POINTER(RKLLMInferParam), ctypes.c_void_p]
         self.rkllm_run.restype = ctypes.c_int
-
-        self.set_chat_template = rkllm_lib.rkllm_set_chat_template
-        self.set_chat_template.argtypes = [RKLLM_Handle_t, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
-        self.set_chat_template.restype = ctypes.c_int
-
-        system_prompt = "<|im_start|>system You are a helpful assistant. <|im_end|>"
-        prompt_prefix = "<|im_start|>user"
-        prompt_postfix = "<|im_end|><|im_start|>assistant"
-        # self.set_chat_template(self.handle, ctypes.c_char_p(system_prompt.encode('utf-8')), ctypes.c_char_p(prompt_prefix.encode('utf-8')), ctypes.c_char_p(prompt_postfix.encode('utf-8')))
-
         self.rkllm_destroy = rkllm_lib.rkllm_destroy
         self.rkllm_destroy.argtypes = [RKLLM_Handle_t]
         self.rkllm_destroy.restype = ctypes.c_int
-
-        rkllm_lora_params = None
-        if lora_model_path:
-            lora_adapter_name = "test"
-            lora_adapter = RKLLMLoraAdapter()
-            ctypes.memset(ctypes.byref(lora_adapter), 0, ctypes.sizeof(RKLLMLoraAdapter))
-            lora_adapter.lora_adapter_path = ctypes.c_char_p((lora_model_path).encode('utf-8'))
-            lora_adapter.lora_adapter_name = ctypes.c_char_p((lora_adapter_name).encode('utf-8'))
-            lora_adapter.scale = 1.0
-
-            rkllm_load_lora = rkllm_lib.rkllm_load_lora
-            rkllm_load_lora.argtypes = [RKLLM_Handle_t, ctypes.POINTER(RKLLMLoraAdapter)]
-            rkllm_load_lora.restype = ctypes.c_int
-            rkllm_load_lora(self.handle, ctypes.byref(lora_adapter))
-            rkllm_lora_params = RKLLMLoraParam()
-            rkllm_lora_params.lora_adapter_name = ctypes.c_char_p((lora_adapter_name).encode('utf-8'))
-
         self.rkllm_infer_params = RKLLMInferParam()
-        ctypes.memset(ctypes.byref(self.rkllm_infer_params), 0, ctypes.sizeof(RKLLMInferParam))
+        ctypes.memset(ctypes.byref(self.rkllm_infer_params), 0, ctypes.sizeof(self.rkllm_infer_params))
         self.rkllm_infer_params.mode = RKLLMInferMode.RKLLM_INFER_GENERATE
-        self.rkllm_infer_params.lora_params = ctypes.pointer(rkllm_lora_params) if rkllm_lora_params else None
         self.rkllm_infer_params.keep_history = 0
-
-        self.prompt_cache_path = None
+        if lora_model_path:
+            adapter = RKLLMLoraAdapter(ctypes.c_char_p(lora_model_path.encode()), ctypes.c_char_p(b"test"), 1.0)
+            load = rkllm_lib.rkllm_load_lora
+            load.argtypes = [RKLLM_Handle_t, ctypes.POINTER(RKLLMLoraAdapter)]
+            load.restype = ctypes.c_int
+            load(self.handle, ctypes.byref(adapter))
+            lp = RKLLMLoraParam(ctypes.c_char_p(b"test"))
+            self.rkllm_infer_params.lora_params = ctypes.pointer(lp)
+            self._lora_param = lp
         if prompt_cache_path:
-            self.prompt_cache_path = prompt_cache_path
-
-            rkllm_load_prompt_cache = rkllm_lib.rkllm_load_prompt_cache
-            rkllm_load_prompt_cache.argtypes = [RKLLM_Handle_t, ctypes.c_char_p]
-            rkllm_load_prompt_cache.restype = ctypes.c_int
-            rkllm_load_prompt_cache(self.handle, ctypes.c_char_p((prompt_cache_path).encode('utf-8')))
+            load_cache = rkllm_lib.rkllm_load_prompt_cache
+            load_cache.argtypes = [RKLLM_Handle_t, ctypes.c_char_p]
+            load_cache.restype = ctypes.c_int
+            load_cache(self.handle, ctypes.c_char_p(prompt_cache_path.encode()))
 
     def run(self, prompt, sampling_params=None, max_new_tokens=None):
-        rkllm_input = RKLLMInput()
-        rkllm_input.role = "user".encode('utf-8')
-        rkllm_input.enable_thinking = ctypes.c_bool(False)
-        rkllm_input.input_type = RKLLMInputType.RKLLM_INPUT_PROMPT
-        rkllm_input.prompt_input = ctypes.c_char_p(prompt.encode('utf-8'))
-
-        # Apply per-request sampling params and max_new_tokens
+        inp = RKLLMInput()
+        inp.role, inp.enable_thinking, inp.input_type = b"user", False, RKLLMInputType.RKLLM_INPUT_PROMPT
+        inp.prompt_input = ctypes.c_char_p(prompt.encode('utf-8'))
         if sampling_params is not None:
             self.rkllm_infer_params.sampling_params = ctypes.pointer(sampling_params)
         if max_new_tokens is not None:
             self.rkllm_infer_params.max_new_tokens = max_new_tokens
-
-        self.rkllm_run(self.handle, ctypes.byref(rkllm_input), ctypes.byref(self.rkllm_infer_params), None)
-
-        # Reset sampling_params to NULL after run (avoid dangling pointer)
-        if sampling_params is not None:
+        try:
+            return self.rkllm_run(self.handle, ctypes.byref(inp), ctypes.byref(self.rkllm_infer_params), None)
+        finally:
             self.rkllm_infer_params.sampling_params = None
-        # Reset max_new_tokens to 0 after run (<=0 means use init value)
-        if max_new_tokens is not None:
             self.rkllm_infer_params.max_new_tokens = 0
-        return
 
     def release(self):
         self.rkllm_destroy(self.handle)
 
+# ---------------- OpenAI-compatible API, including tools/tool_calls ----------------
+model_lock = threading.Lock()
 
-class OpenAIRequestHandler(BaseHTTPRequestHandler):
+def content_text(value):
+    if isinstance(value, str): return value
+    if isinstance(value, list):
+        return " ".join(str(x.get("text", "")) for x in value if isinstance(x, dict) and x.get("type") == "text")
+    return ""
+
+def tool_call_from_text(text):
+    patterns = [r"<tool_call>\s*(.*?)\s*</tool_call>", r"<\|tool_call\|>\s*(.*?)\s*<\|tool_call_end\|>"]
+    candidates = sum((re.findall(p, text, re.S) for p in patterns), []) + [text.strip()]
+    for raw in candidates:
+        try: value = json.loads(raw)
+        except (TypeError, ValueError): continue
+        if isinstance(value, dict) and isinstance(value.get("tool_calls"), list):
+            value = value["tool_calls"][0] if value["tool_calls"] else {}
+        if not isinstance(value, dict): continue
+        fn = value.get("function", value)
+        if not isinstance(fn, dict) or not fn.get("name"): continue
+        args = fn.get("arguments", {})
+        if not isinstance(args, str): args = json.dumps(args, ensure_ascii=False)
+        return {"id": value.get("id", "call_" + uuid.uuid4().hex), "type": "function", "function": {"name": fn["name"], "arguments": args}}
+    return None
+
+def messages_prompt(messages, tools):
+    lines = ["You are a helpful assistant. If a tool is needed, output only <tool_call>{\"name\":\"function_name\",\"arguments\":{}}</tool_call>."]
+    if tools: lines.append("Available tools: " + json.dumps(tools, ensure_ascii=False))
+    for m in messages:
+        if not isinstance(m, dict): continue
+        role, value = m.get("role", "user"), m.get("content", "")
+        if role == "assistant" and m.get("tool_calls"): value = json.dumps(m["tool_calls"], ensure_ascii=False)
+        lines.append(role + ": " + content_text(value))
+    lines.append("assistant:")
+    return "\n".join(lines)
+
+def generate_text(model, prompt, max_tokens=None):
+    global global_text, global_state
+    with model_lock:
+        global_text, global_state = [], -1
+        worker = threading.Thread(target=model.run, args=(prompt, None, max_tokens), daemon=True)
+        worker.start()
+        chunks = []
+        while worker.is_alive() or global_text:
+            while global_text: chunks.append(global_text.pop(0))
+            worker.join(.01)
+        return "".join(chunks)
+
+class OpenAIHandler(BaseHTTPRequestHandler):
     server_version = "RKLLMOpenAI/1.0"
-
-    def log_message(self, fmt, *args):
-        pass
-
-    def _send_json(self, status, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_json(self):
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length)
-            if not raw:
-                return {}
-            return json.loads(raw.decode("utf-8"))
-        except Exception:
-            return None
-
-    @staticmethod
-    def _content_to_text(content):
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            text_parts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text_parts.append(part.get("text", ""))
-            return " ".join(text_parts)
-        return ""
-
-    def _extract_prompt(self, messages):
-        if not isinstance(messages, list):
-            return ""
-        for message in reversed(messages):
-            if isinstance(message, dict) and message.get("role") == "user":
-                return self._content_to_text(message.get("content", ""))
-        return ""
-
+    def log_message(self, fmt, *args): pass
+    def body(self):
+        try: return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        except (ValueError, TypeError, json.JSONDecodeError): return None
+    def send_json(self, status, value):
+        raw = json.dumps(value, ensure_ascii=False).encode()
+        self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
     def do_GET(self):
         if self.path.rstrip("/") == "/v1/models":
-            self._send_json(200, {
-                "object": "list",
-                "data": [{
-                    "id": self.server.model_name,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "rkllm",
-                }],
-            })
-            return
-        self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
-
+            self.send_json(200, {"object":"list", "data":[{"id":self.server.model_name,"object":"model","created":int(time.time()),"owned_by":"rkllm"}]})
+        else: self.send_json(404, {"error":{"message":"Not found","type":"invalid_request_error"}})
     def do_POST(self):
         if self.path.rstrip("/") != "/v1/chat/completions":
-            self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
-            return
-
-        payload = self._read_json()
-        if not isinstance(payload, dict):
-            self._send_json(400, {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
-            return
-
-        prompt = self._extract_prompt(payload.get("messages", []))
-        if not prompt:
-            self._send_json(400, {
-                "error": {
-                    "message": "messages must contain at least one user message",
-                    "type": "invalid_request_error",
-                }
-            })
-            return
-
-        sampling_params = RKLLMSamplingParam()
-        sampling_params.top_k = int(payload.get("top_k", 1))
-        sampling_params.top_p = float(payload.get("top_p", 0.9))
-        sampling_params.temperature = float(payload.get("temperature", 0.8))
-        sampling_params.repeat_penalty = float(payload.get("repeat_penalty", 1.1))
-        sampling_params.frequency_penalty = float(payload.get("frequency_penalty", 0.0))
-        sampling_params.presence_penalty = float(payload.get("presence_penalty", 0.0))
-        sampling_params.mirostat = int(payload.get("mirostat", 0))
-        sampling_params.mirostat_tau = float(payload.get("mirostat_tau", 5.0))
-        sampling_params.mirostat_eta = float(payload.get("mirostat_eta", 0.1))
-
-        max_new_tokens = payload.get("max_tokens")
-        if max_new_tokens is not None:
-            max_new_tokens = int(max_new_tokens)
-
-        stream = bool(payload.get("stream", False))
-        if stream:
-            self._stream_response(prompt, sampling_params, max_new_tokens)
+            self.send_json(404, {"error":{"message":"Not found","type":"invalid_request_error"}}); return
+        req = self.body()
+        if not isinstance(req, dict) or not isinstance(req.get("messages"), list) or not req["messages"]:
+            self.send_json(400, {"error":{"message":"messages must be a non-empty array","type":"invalid_request_error"}}); return
+        messages, tools = req["messages"], req.get("tools", [])
+        text = generate_text(self.server.model, messages_prompt(messages, tools), req.get("max_tokens"))
+        tc = tool_call_from_text(text) if tools else None
+        rid, now = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
+        if tc:
+            message, finish = {"role":"assistant","content":None,"tool_calls":[tc]}, "tool_calls"
         else:
-            text = "".join(self.server.generate(prompt, sampling_params, max_new_tokens))
-            self._send_json(200, {
-                "id": "chatcmpl-" + str(int(time.time() * 1000000)),
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": self.server.model_name,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
-                }],
-            })
+            message, finish = {"role":"assistant","content":text}, "stop"
+        if not req.get("stream"):
+            self.send_json(200, {"id":rid,"object":"chat.completion","created":now,"model":self.server.model_name,"choices":[{"index":0,"message":message,"finish_reason":finish}]}); return
+        self.send_response(200); self.send_header("Content-Type","text/event-stream"); self.send_header("Cache-Control","no-cache"); self.end_headers()
+        delta = {"role":"assistant","content":None,"tool_calls":message["tool_calls"]} if tc else {"role":"assistant","content":text}
+        chunk = {"id":rid,"object":"chat.completion.chunk","created":now,"model":self.server.model_name,"choices":[{"index":0,"delta":delta,"finish_reason":None}]}
+        self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode()); self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
 
-    def _stream_response(self, prompt, sampling_params, max_new_tokens):
-        request_id = "chatcmpl-" + str(int(time.time() * 1000000))
-        created = int(time.time())
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-
-        def emit(payload):
-            self.wfile.write(("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
-            self.wfile.flush()
-
-        try:
-            for chunk in self.server.generate(prompt, sampling_params, max_new_tokens):
-                emit({
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": self.server.model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": chunk},
-                        "finish_reason": None,
-                    }],
-                })
-            emit({
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": self.server.model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }],
-            })
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-
-class OpenAICompatibleServer(ThreadingHTTPServer):
+class OpenAIServer(ThreadingHTTPServer):
     allow_reuse_address = True
+    def __init__(self, address, model, model_name="rkllm"):
+        self.model, self.model_name = model, model_name
+        super().__init__(address, OpenAIHandler)
 
-    def __init__(self, server_address, model, model_name="rkllm"):
-        self.model = model
-        self.model_name = model_name
-        self._lock = threading.Lock()
-        super().__init__(server_address, OpenAIRequestHandler)
-
-    def generate(self, prompt, sampling_params=None, max_new_tokens=None):
-        global global_text, global_state
-        with self._lock:
-            global_text = []
-            global_state = -1
-
-            worker = threading.Thread(
-                target=self.model.run,
-                args=(prompt, sampling_params, max_new_tokens),
-                daemon=True,
-            )
-            worker.start()
-
-            while worker.is_alive() or len(global_text) > 0:
-                while len(global_text) > 0:
-                    yield global_text.pop(0)
-                worker.join(timeout=0.01)
-
-
-def start_openai_server(model, host="0.0.0.0", port=8000, model_name="rkllm"):
-    server = OpenAICompatibleServer((host, port), model, model_name)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print(f"OpenAI-compatible API listening on http://{host}:{port}/v1")
+def start_openai_server(model, host="0.0.0.0", port=8000):
+    server = OpenAIServer((host, port), model)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print("OpenAI API listening on http://{}:{}/v1".format(host, port))
     return server
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--rkllm_model_path', type=str, required=True, help='Absolute path of the converted RKLLM model on the Linux board;')
-    parser.add_argument('--target_platform', type=str, required=True, help='Target platform: e.g., rk3588/rk3576;')
-    parser.add_argument('--lora_model_path', type=str, help='Absolute path of the lora_model on the Linux board;')
-    parser.add_argument('--prompt_cache_path', type=str, help='Absolute path of the prompt_cache file on the Linux board;')
-    parser.add_argument('--openai_host', type=str, default='0.0.0.0', help='Host for the OpenAI compatible HTTP API (default: 0.0.0.0).')
-    parser.add_argument('--openai_port', type=int, default=8000, help='Port for the OpenAI compatible HTTP API (set to 0 to disable).')
+    parser.add_argument('--rkllm_model_path', type=str, required=True)
+    parser.add_argument('--target_platform', type=str, required=True)
+    parser.add_argument('--lora_model_path', type=str)
+    parser.add_argument('--prompt_cache_path', type=str)
+    parser.add_argument('--openai_host', type=str, default='0.0.0.0')
+    parser.add_argument('--openai_port', type=int, default=8000, help='Set 0 to disable the OpenAI API.')
     args = parser.parse_args()
-
-    if not os.path.exists(args.rkllm_model_path):
-        print("Error: Please provide the correct rkllm model path, and ensure it is the absolute path on the board.")
-        sys.stdout.flush()
-        exit()
-
-    if not (args.target_platform in ["rk3588", "rk3576", "rv1126b", "rk3562"]):
-        print("Error: Please specify the correct target platform: rk3588/rk3576/rv1126b/rk3562.")
-        sys.stdout.flush()
-        exit()
-
-    if args.lora_model_path:
-        if not os.path.exists(args.lora_model_path):
-            print("Error: Please provide the correct lora_model path, and advise it is the absolute path on the board.")
-            sys.stdout.flush()
-            exit()
-
-    if args.prompt_cache_path:
-        if not os.path.exists(args.prompt_cache_path):
-            print("Error: Please provide the correct prompt_cache_file path, and advise it is the absolute path on the board.")
-            sys.stdout.flush()
-            exit()
-
-    # Fix frequency
-    command = "sudo bash fix_freq_{}.sh".format(args.target_platform)
-    subprocess.run(command, shell=True)
-
-    # Set resource limit
+    if not os.path.exists(args.rkllm_model_path): raise SystemExit("Invalid rkllm model path")
+    if args.target_platform not in ["rk3588", "rk3576", "rv1126b", "rk3562"]: raise SystemExit("Invalid target platform")
+    for path, label in [(args.lora_model_path, "lora_model"), (args.prompt_cache_path, "prompt_cache")]:
+        if path and not os.path.exists(path): raise SystemExit("Invalid {} path".format(label))
+    subprocess.run("sudo bash fix_freq_{}.sh".format(args.target_platform), shell=True)
     resource.setrlimit(resource.RLIMIT_NOFILE, (102400, 102400))
-
-    # Initialize RKLLM model
     print("=========init....===========")
-    sys.stdout.flush()
-    model_path = args.rkllm_model_path
-    rkllm_model = RKLLM(model_path, args.lora_model_path, args.prompt_cache_path, args.target_platform)
-    print("==============================")
-    sys.stdout.flush()
+    rkllm_model = RKLLM(args.rkllm_model_path, args.lora_model_path, args.prompt_cache_path, args.target_platform)
+    openai_server = start_openai_server(rkllm_model, args.openai_host, args.openai_port) if args.openai_port else None
 
-    openai_server = None
-    if args.openai_port != 0:
-        openai_server = start_openai_server(rkllm_model, host=args.openai_host, port=args.openai_port, model_name="rkllm")
-
-    # Graceful shutdown on Ctrl+C
     def shutdown_handler(signum, frame):
-        print("\n====================")
-        print("Received interrupt signal, releasing RKLLM model resources...")
-        rkllm_model.release()
-        print("====================")
-        sys.exit(0)
+        if openai_server: openai_server.shutdown(); openai_server.server_close()
+        rkllm_model.release(); sys.exit(0)
+    signal.signal(signal.SIGINT, shutdown_handler); signal.signal(signal.SIGTERM, shutdown_handler)
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-
-    # Record the user's input prompt (new Gradio dict format)
-    def get_user_input(user_message, history):
-        history = history + [{"role": "user", "content": user_message}]
-        return "", history
-
-    # Retrieve the output from the RKLLM model and print it in a streaming manner
+    def get_user_input(user_message, history): return "", history + [{"role":"user","content":user_message}]
     def get_RKLLM_output(history):
-        # Link global variables to retrieve the output information from the callback function
         global global_text, global_state
-        global_text = []
-        global_state = -1
+        user_content = next((content_text(x.get("content", "")) for x in reversed(history) if isinstance(x, dict) and x.get("role") == "user"), "")
+        history = history + [{"role":"assistant","content":""}]
+        with model_lock:
+            global_text, global_state = [], -1
+            worker = threading.Thread(target=rkllm_model.run, args=(user_content,), daemon=True); worker.start()
+            while worker.is_alive() or global_text:
+                while global_text: history[-1]["content"] += global_text.pop(0); yield history
+                worker.join(.005)
 
-        # Extract the last user message content for inference.
-        # Supports both old [[user, assistant], ...] and new [{"role": ..., "content": ...}] formats.
-        user_content = ""
-        for msg in reversed(history):
-            if isinstance(msg, dict):
-                if msg.get("role") == "user":
-                    c = msg.get("content", "")
-                    if isinstance(c, list):
-                        # Multimodal format: [{"type": "text", "text": "..."}]
-                        c = " ".join(p.get("text", "") for p in c if p.get("type") == "text")
-                    user_content = c
-                    break
-            elif isinstance(msg, (list, tuple)) and len(msg) >= 1:
-                # Old format: [user_text, assistant_text]
-                user_content = msg[0] or ""
-                break
-
-        # Create a thread for model inference
-        model_thread = threading.Thread(target=rkllm_model.run, args=(user_content,))
-        model_thread.start()
-
-        # Append a placeholder assistant message (new dict format)
-        history = history + [{"role": "assistant", "content": ""}]
-
-        # Wait for the model to finish running and periodically check the inference thread
-        model_thread_finished = False
-        while not model_thread_finished:
-            while len(global_text) > 0:
-                history[-1]["content"] += global_text.pop(0)
-                time.sleep(0.005)
-                yield history
-
-            model_thread.join(timeout=0.005)
-            model_thread_finished = not model_thread.is_alive()
-
-    # Create a Gradio interface
     with gr.Blocks(title="Chat with RKLLM") as chatRKLLM:
         gr.Markdown("<div align='center'><font size='70'> Chat with RKLLM </font></div>")
         gr.Markdown("### Enter your question in the inputTextBox and press the Enter key to chat with the RKLLM model.")
-        # Create a Chatbot component to display conversation history
-        rkllmServer = gr.Chatbot(height=600)
-        # Create a Textbox component for user message input
-        msg = gr.Textbox(placeholder="Please input your question here...", label="inputTextBox")
-        # Create a Button component to clear the chat history.
-        clear = gr.Button("Clear")
-
-        # Submit the user's input message to the get_user_input function and immediately update the chat history.
-        # Then call the get_RKLLM_output function to further update the chat history.
-        # The queue=False parameter ensures that these updates are not queued, but executed immediately.
+        rkllmServer = gr.Chatbot(height=600); msg = gr.Textbox(placeholder="Please input your question here...", label="inputTextBox"); clear = gr.Button("Clear")
         msg.submit(get_user_input, [msg, rkllmServer], [msg, rkllmServer], queue=False).then(get_RKLLM_output, rkllmServer, rkllmServer)
-        # When the clear button is clicked, perform a no-operation (lambda: None) and immediately clear the chat history.
         clear.click(lambda: None, None, rkllmServer, queue=False)
-
-    # Enable the event queue system.
     chatRKLLM.queue()
-
-    try:
-        # Start the Gradio application.
-        chatRKLLM.launch()
+    try: chatRKLLM.launch()
     finally:
-        print("====================")
-        print("RKLLM model inference completed, releasing RKLLM model resources...")
-        if openai_server is not None:
-            try:
-                openai_server.shutdown()
-                openai_server.server_close()
-            except Exception:
-                pass
+        if openai_server:
+            openai_server.shutdown(); openai_server.server_close()
         rkllm_model.release()
-        print("====================")
