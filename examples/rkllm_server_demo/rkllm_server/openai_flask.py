@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from flask import Flask, Response, jsonify, request, stream_with_context
 
@@ -263,6 +263,101 @@ class RKLLMModel:
 
 
 # ---------------------------------------------------------------------------
+# Tool registry
+# ---------------------------------------------------------------------------
+
+TOOL_FUNCTIONS: Dict[str, Callable[..., Any]] = {}
+
+
+def register_tool(name: str):
+    def decorator(func: Callable[..., Any]):
+        TOOL_FUNCTIONS[name] = func
+        return func
+    return decorator
+
+
+@register_tool("get_current_time")
+def get_current_time():
+    return {"time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}
+
+
+@register_tool("get_weather")
+def get_weather(city: str, unit: str = "celsius"):
+    # Demo implementation for compatibility testing.
+    fake = {
+        "Beijing": 26,
+        "Shanghai": 29,
+        "New York": 21,
+        "London": 18,
+    }
+    temp = fake.get(city, 22)
+    return {"city": city, "temperature": temp, "unit": unit, "condition": "sunny"}
+
+
+@register_tool("calculator")
+def calculator(a: float, b: float, op: str = "+"):
+    if op == "+":
+        value = a + b
+    elif op == "-":
+        value = a - b
+    elif op == "*":
+        value = a * b
+    elif op == "/":
+        value = a / b if b != 0 else "division by zero"
+    else:
+        value = {"error": f"unsupported op: {op}"}
+    return {"result": value}
+
+
+def execute_tool_calls(tool_calls: List[Dict[str, Any]]):
+    assistant_message = {"role": "assistant", "content": None, "tool_calls": []}
+    tool_messages: List[Dict[str, Any]] = []
+
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function", call)
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        arguments = fn.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except Exception:
+                arguments = {}
+        if not name:
+            continue
+        if name not in TOOL_FUNCTIONS:
+            result = {"error": f"Unknown tool: {name}"}
+        else:
+            try:
+                result = TOOL_FUNCTIONS[name](**arguments)
+            except TypeError as exc:
+                result = {"error": f"Invalid arguments for {name}: {exc}"}
+            except Exception as exc:
+                result = {"error": f"Tool execution failed for {name}: {exc}"}
+
+        tool_call_entry = {
+            "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+            },
+        }
+        assistant_message["tool_calls"].append(tool_call_entry)
+        tool_messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_entry["id"],
+            "name": name,
+            "content": json.dumps(result, ensure_ascii=False),
+        })
+
+    return assistant_message, tool_messages
+
+
+# ---------------------------------------------------------------------------
 # OpenAI-compatible helpers
 # ---------------------------------------------------------------------------
 
@@ -345,8 +440,6 @@ def build_model_prompt(messages: List[Dict[str, Any]], tools: Optional[List[Dict
 def extract_tool_calls(raw_text: str):
     """Parse raw model output into OpenAI tool_calls structure."""
     candidates: List[str] = []
-
-    # Normalize common output templates.
     for pattern in (
         r"<tool_call>\s*(.*?)\s*</tool_call>",
         r"<\|tool_call\|>\s*(.*?)\s*<\|tool_call_end\|>",
@@ -474,6 +567,7 @@ def chat_completions():
     stream = bool(data.get("stream", False))
     tools = data.get("tools") or []
     tool_choice = data.get("tool_choice", "auto")
+    auto_execute_tools = bool(data.get("auto_execute_tools", False))
     max_tokens = int(data.get("max_tokens", 4096))
     temperature = float(data.get("temperature", 0.8))
     top_p = float(data.get("top_p", 0.9))
@@ -508,6 +602,22 @@ def chat_completions():
     if tool_choice == "required" and not tool_calls:
         return error_response("The model did not produce the required tool call.", "server_error", 500)
 
+    if auto_execute_tools and tool_calls:
+        assistant_msg, reply_msgs = execute_tool_calls(tool_calls)
+        followup_messages = messages + [assistant_msg] + reply_msgs
+        with MODEL_LOCK:
+            followup_prompt = build_model_prompt(followup_messages, tools if tool_choice != "none" else [])
+            final_output = run_inference(rkllm_model, followup_prompt, "user", enable_thinking, parse_sampling_params({
+                "top_k": top_k,
+                "top_p": top_p,
+                "temperature": temperature,
+                "repeat_penalty": data.get("repeat_penalty", 1.1),
+                "frequency_penalty": data.get("frequency_penalty", 0.0),
+                "presence_penalty": data.get("presence_penalty", 0.0),
+            }), max_tokens)
+        output = final_output
+        tool_calls = []
+
     prompt_tokens = max(1, len(prompt.split()))
     completion_tokens = max(1, len(output.split()))
     usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
@@ -525,9 +635,7 @@ def chat_completions():
         return jsonify(response)
 
     def generate_stream():
-        base_id = "chatcmpl-" + uuid.uuid4().hex[:24]
-        initial_delta = {"role": "assistant"}
-        yield build_stream_chunk(model_name, initial_delta, None)
+        yield build_stream_chunk(model_name, {"role": "assistant"}, None)
 
         if tool_calls:
             for index, call in enumerate(tool_calls):
@@ -545,16 +653,11 @@ def chat_completions():
                 )
             finish_reason = "tool_calls"
         else:
-            # Split text into sensible chunks for OpenAI-compatible streaming.
             for piece in re.findall(r".{1,64}", output, flags=re.S):
                 yield build_stream_chunk(model_name, {"content": piece}, None)
             finish_reason = "stop"
 
-        final_chunk = {
-            "content": "",
-            "role": "assistant",
-        }
-        yield build_stream_chunk(model_name, final_chunk, finish_reason)
+        yield build_stream_chunk(model_name, {"content": ""}, finish_reason)
         yield "data: [DONE]\n\n"
 
     return Response(
