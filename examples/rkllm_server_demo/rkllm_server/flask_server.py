@@ -22,6 +22,7 @@ DEFAULT_MAX_NEW_TOKENS = 512
 MAX_MAX_NEW_TOKENS = 1024
 GENERATION_TIMEOUT_SECONDS = 120
 DISABLE_THINKING = True
+PROMPT_BUDGET = max(1024, MAX_CONTEXT_TOKENS - DEFAULT_MAX_NEW_TOKENS)
 
 RKLLM_Handle_t = ctypes.c_void_p
 LLMCallState = ctypes.c_int
@@ -34,48 +35,68 @@ RKLLMInputType.RKLLM_INPUT_PROMPT = 0
 RKLLMInferMode = ctypes.c_int
 RKLLMInferMode.RKLLM_INFER_GENERATE = 0
 
+
 class RKLLMExtendParam(ctypes.Structure):
-    _fields_ = [("base_domain_id", ctypes.c_int32), ("embed_flash", ctypes.c_int8),
-                ("enabled_cpus_num", ctypes.c_int8), ("enabled_cpus_mask", ctypes.c_uint32),
-                ("n_batch", ctypes.c_uint8), ("use_cross_attn", ctypes.c_int8),
-                ("reserved", ctypes.c_uint8 * 104)]
+    _fields_ = [
+        ("base_domain_id", ctypes.c_int32), ("embed_flash", ctypes.c_int8),
+        ("enabled_cpus_num", ctypes.c_int8), ("enabled_cpus_mask", ctypes.c_uint32),
+        ("n_batch", ctypes.c_uint8), ("use_cross_attn", ctypes.c_int8),
+        ("reserved", ctypes.c_uint8 * 104),
+    ]
+
 
 class RKLLMParam(ctypes.Structure):
-    _fields_ = [("model_path", ctypes.c_char_p), ("max_context_len", ctypes.c_int32),
-                ("max_new_tokens", ctypes.c_int32), ("top_k", ctypes.c_int32),
-                ("n_keep", ctypes.c_int32), ("top_p", ctypes.c_float),
-                ("temperature", ctypes.c_float), ("repeat_penalty", ctypes.c_float),
-                ("frequency_penalty", ctypes.c_float), ("presence_penalty", ctypes.c_float),
-                ("mirostat", ctypes.c_int32), ("mirostat_tau", ctypes.c_float),
-                ("mirostat_eta", ctypes.c_float), ("skip_special_token", ctypes.c_bool),
-                ("ignore_eos_token", ctypes.c_bool), ("is_async", ctypes.c_bool),
-                ("extend_param", RKLLMExtendParam)]
+    _fields_ = [
+        ("model_path", ctypes.c_char_p), ("max_context_len", ctypes.c_int32),
+        ("max_new_tokens", ctypes.c_int32), ("top_k", ctypes.c_int32),
+        ("n_keep", ctypes.c_int32), ("top_p", ctypes.c_float),
+        ("temperature", ctypes.c_float), ("repeat_penalty", ctypes.c_float),
+        ("frequency_penalty", ctypes.c_float), ("presence_penalty", ctypes.c_float),
+        ("mirostat", ctypes.c_int32), ("mirostat_tau", ctypes.c_float),
+        ("mirostat_eta", ctypes.c_float), ("skip_special_token", ctypes.c_bool),
+        ("ignore_eos_token", ctypes.c_bool), ("is_async", ctypes.c_bool),
+        ("extend_param", RKLLMExtendParam),
+    ]
+
 
 class RKLLMSamplingParam(ctypes.Structure):
-    _fields_ = [("top_k", ctypes.c_int32), ("top_p", ctypes.c_float),
-                ("temperature", ctypes.c_float), ("repeat_penalty", ctypes.c_float),
-                ("frequency_penalty", ctypes.c_float), ("presence_penalty", ctypes.c_float),
-                ("mirostat", ctypes.c_int32), ("mirostat_tau", ctypes.c_float),
-                ("mirostat_eta", ctypes.c_float)]
+    _fields_ = [
+        ("top_k", ctypes.c_int32), ("top_p", ctypes.c_float),
+        ("temperature", ctypes.c_float), ("repeat_penalty", ctypes.c_float),
+        ("frequency_penalty", ctypes.c_float), ("presence_penalty", ctypes.c_float),
+        ("mirostat", ctypes.c_int32), ("mirostat_tau", ctypes.c_float),
+        ("mirostat_eta", ctypes.c_float),
+    ]
+
 
 class RKLLMInputUnion(ctypes.Union):
     _fields_ = [("prompt_input", ctypes.c_char_p)]
 
+
 class RKLLMInput(ctypes.Structure):
     _anonymous_ = ("input_data",)
-    _fields_ = [("role", ctypes.c_char_p), ("enable_thinking", ctypes.c_bool),
-                ("input_type", RKLLMInputType), ("input_data", RKLLMInputUnion)]
+    _fields_ = [
+        ("role", ctypes.c_char_p), ("enable_thinking", ctypes.c_bool),
+        ("input_type", RKLLMInputType), ("input_data", RKLLMInputUnion),
+    ]
+
 
 class RKLLMInferParam(ctypes.Structure):
-    _fields_ = [("mode", RKLLMInferMode), ("lora_params", ctypes.c_void_p),
-                ("prompt_cache_params", ctypes.c_void_p),
-                ("sampling_params", ctypes.POINTER(RKLLMSamplingParam)),
-                ("keep_history", ctypes.c_int), ("max_new_tokens", ctypes.c_int32)]
+    _fields_ = [
+        ("mode", RKLLMInferMode), ("lora_params", ctypes.c_void_p),
+        ("prompt_cache_params", ctypes.c_void_p),
+        ("sampling_params", ctypes.POINTER(RKLLMSamplingParam)),
+        ("keep_history", ctypes.c_int), ("max_new_tokens", ctypes.c_int32),
+    ]
+
 
 class RKLLMResult(ctypes.Structure):
-    _fields_ = [("text", ctypes.c_char_p), ("token_id", ctypes.c_int),
-                ("last_hidden_layer", ctypes.c_byte * 16), ("logits", ctypes.c_byte * 16),
-                ("perf", ctypes.c_byte * 20)]
+    _fields_ = [
+        ("text", ctypes.c_char_p), ("token_id", ctypes.c_int),
+        ("last_hidden_layer", ctypes.c_byte * 16), ("logits", ctypes.c_byte * 16),
+        ("perf", ctypes.c_byte * 20),
+    ]
+
 
 lock = threading.Lock()
 callback_lock = threading.Lock()
@@ -91,16 +112,30 @@ def callback_impl(result, userdata, state):
             global_text.append(result.contents.text.decode("utf-8", errors="replace"))
     return 0
 
-LLMResultCallback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(RKLLMResult), ctypes.c_void_p, ctypes.c_int)
-LLMTokenizerCallback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32), ctypes.c_int32)
-LLMGetEmbedCallback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64)
+
+LLMResultCallback_type = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.POINTER(RKLLMResult), ctypes.c_void_p, ctypes.c_int
+)
+LLMTokenizerCallback_type = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32,
+    ctypes.POINTER(ctypes.c_int32), ctypes.c_int32,
+)
+LLMGetEmbedCallback_type = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+    ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64,
+)
+
 
 class RKLLMCallback(ctypes.Structure):
-    _fields_ = [("result_callback", LLMResultCallback_type), ("result_userdata", ctypes.c_void_p),
-                ("tokenizer_callback", LLMTokenizerCallback_type), ("tokenizer_userdata", ctypes.c_void_p),
-                ("embed_callback", LLMGetEmbedCallback_type), ("embed_userdata", ctypes.c_void_p)]
+    _fields_ = [
+        ("result_callback", LLMResultCallback_type), ("result_userdata", ctypes.c_void_p),
+        ("tokenizer_callback", LLMTokenizerCallback_type), ("tokenizer_userdata", ctypes.c_void_p),
+        ("embed_callback", LLMGetEmbedCallback_type), ("embed_userdata", ctypes.c_void_p),
+    ]
+
 
 _callback = LLMResultCallback_type(callback_impl)
+
 
 class RKLLM:
     def __init__(self, model_path, platform):
@@ -179,8 +214,7 @@ def text_content(value):
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, list):
-        return " ".join(str(x.get("text", "")) for x in value
-                         if isinstance(x, dict) and x.get("type") == "text").strip()
+        return " ".join(str(x.get("text", "")) for x in value if isinstance(x, dict) and x.get("type") == "text").strip()
     return ""
 
 
@@ -241,7 +275,10 @@ def compact_tools(tools):
     return result
 
 
-def semantic_compact(messages, tools, budget=2600):
+def semantic_compact(messages, tools, budget=None):
+    if budget is None:
+        budget = PROMPT_BUDGET
+
     valid = [compact_message(m) for m in messages if isinstance(m, dict)]
     system = next((m for m in valid if m.get("role") == "system"), None)
     rest = [m for m in valid if m.get("role") != "system"]
@@ -250,30 +287,50 @@ def semantic_compact(messages, tools, budget=2600):
     keep = list(rest if native_system else (([system] if system else []) + rest))
 
     def cost(items):
-        return token_estimate(prompt_from_messages(items)) + token_estimate(json.dumps(compacted_tools, ensure_ascii=False, separators=(",", ":")))
+        prompt_cost = token_estimate(prompt_from_messages(items))
+        tools_cost = token_estimate(json.dumps(compacted_tools, ensure_ascii=False, separators=(",", ":")))
+        system_cost = 0
+        if native_system and system:
+            system_cost = token_estimate(text_content(system.get("content", "")))
+        return prompt_cost + tools_cost + system_cost
 
-    removed = []
-    i = 0
-    while i < len(keep):
-        if (keep[i].get("role") == "assistant" and keep[i].get("tool_calls") and
-                i + 1 < len(keep) and keep[i + 1].get("role") == "tool" and len(keep) > 2):
-            removed.extend(keep[i:i + 2])
-            del keep[i:i + 2]
-            continue
-        i += 1
+    latest_user_index = -1
+    for i, msg in enumerate(keep):
+        if msg.get("role") == "user":
+            latest_user_index = i
 
-    for role in ("assistant", "user"):
-        i = 0
-        while cost(keep) > budget and i < len(keep) - 1:
-            if keep[i].get("role") == role:
-                removed.append(keep.pop(i))
-                continue
-            i += 1
+    protected_from = latest_user_index if latest_user_index >= 0 else len(keep)
 
-    if cost(keep) > budget:
-        raise ValueError("prompt remains too large after semantic compaction; reduce system prompt, tools, or latest message")
+    def tool_call_block_end(items, start):
+        if start >= len(items):
+            return start
+        if items[start].get("role") == "assistant" and items[start].get("tool_calls"):
+            end = start + 1
+            while end < len(items) and items[end].get("role") == "tool":
+                end += 1
+            return end
+        return start + 1
+
+    removed = 0
+    while cost(keep) > budget and len(keep) > 1:
+        deleted_any = False
+        for i in range(min(len(keep), protected_from)):
+            if keep[i].get("role") == "assistant" and keep[i].get("tool_calls"):
+                end = tool_call_block_end(keep, i)
+                if end > i:
+                    del keep[i:end]
+                    removed += end - i
+                    deleted_any = True
+                    break
+            del keep[i]
+            removed += 1
+            deleted_any = True
+            break
+        if not deleted_any:
+            raise ValueError("prompt remains too large after safe compaction; reduce tools, system prompt, or max_tokens")
+
     if removed:
-        log.info("semantic compaction removed %d complete history messages", len(removed))
+        log.info("semantic compaction removed %d old history messages; latest request and tool results preserved", removed)
     return keep, compacted_tools, system, native_system
 
 
@@ -302,9 +359,12 @@ def extract_tool_calls(raw):
             value = json.loads(block)
         except (TypeError, ValueError):
             continue
-        if isinstance(value, dict) and isinstance(value.get("tool_calls"), list): values.extend(value["tool_calls"])
-        elif isinstance(value, list): values.extend(value)
-        elif isinstance(value, dict): values.append(value)
+        if isinstance(value, dict) and isinstance(value.get("tool_calls"), list):
+            values.extend(value["tool_calls"])
+        elif isinstance(value, list):
+            values.extend(value)
+        elif isinstance(value, dict):
+            values.append(value)
     calls = []
     for value in values:
         if not isinstance(value, dict):
@@ -365,7 +425,15 @@ def run_model(model, prompt, role, thinking, sampling, max_tokens, timeout=GENER
 
 def make_sampling(data):
     p = RKLLMSamplingParam()
-    p.top_k = int(data.get("top_k", 1)); p.top_p = float(data.get("top_p", .9)); p.temperature = float(data.get("temperature", .8)); p.repeat_penalty = float(data.get("repeat_penalty", 1.1)); p.frequency_penalty = float(data.get("frequency_penalty", 0)); p.presence_penalty = float(data.get("presence_penalty", 0))
+    p.top_k = int(data.get("top_k", 1))
+    p.top_p = float(data.get("top_p", .9))
+    p.temperature = float(data.get("temperature", .8))
+    p.repeat_penalty = float(data.get("repeat_penalty", 1.1))
+    p.frequency_penalty = float(data.get("frequency_penalty", 0.0))
+    p.presence_penalty = float(data.get("presence_penalty", 0.0))
+    p.mirostat = int(data.get("mirostat", 0))
+    p.mirostat_tau = float(data.get("mirostat_tau", 5.0))
+    p.mirostat_eta = float(data.get("mirostat_eta", 0.1))
     return p
 
 
@@ -387,7 +455,7 @@ def chat_completions():
     tools_for_model = [] if choice == "none" else tools
     log.info("request start id=%s stream=%s messages=%d tools=%d", request_id, data.get("stream", False), len(raw_messages), len(tools_for_model))
     try:
-        messages, compacted_tools, system, native_system = semantic_compact(raw_messages, tools_for_model)
+        messages, compacted_tools, system, native_system = semantic_compact(raw_messages, tools_for_model, budget=PROMPT_BUDGET)
         diagnostic_breakdown(messages, compacted_tools, system, native_system)
         prompt = prompt_from_messages(messages)
         requested = int(data.get("max_tokens", DEFAULT_MAX_NEW_TOKENS))
@@ -444,9 +512,11 @@ if __name__ == '__main__':
     subprocess.run("sudo bash fix_freq_{}.sh".format(args.target_platform), shell=True)
     resource.setrlimit(resource.RLIMIT_NOFILE, (102400, 102400))
     rkllm_model = RKLLM(args.rkllm_model_path, args.target_platform)
+
     def shutdown(signum, frame):
         rkllm_model.release()
         raise SystemExit(0)
+
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     try:
